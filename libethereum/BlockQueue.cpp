@@ -69,8 +69,8 @@ void BlockQueue::verifierBody()
 {
     while (!m_deleting)
     {
+        bool const wasFull = knownFull();
         UnverifiedBlock work;
-
         {
             unique_lock<Mutex> l(m_verification);
             m_moreToVerify.wait(l, [&](){ return !m_unverified.isEmpty() || m_deleting; });
@@ -86,12 +86,15 @@ void BlockQueue::verifierBody()
 
         VerifiedBlock res;
         swap(work.blockData, res.blockData);
+        bool verificationSucceeded = true;
         try
         {
             res.verified = m_bc->verifyBlock(&res.blockData, m_onBad, ImportRequirements::OutOfOrderChecks);
         }
         catch (std::exception const& _ex)
         {
+            verificationSucceeded = false;
+
             // bad block.
             // has to be this order as that's how invariants() assumes.
             WriteGuard l2(m_lock);
@@ -101,36 +104,40 @@ void BlockQueue::verifierBody()
             if (!m_verifying.remove(work.hash))
                 cwarn << "Unexpected exception when verifying block: " << _ex.what();
             drainVerified_WITH_BOTH_LOCKS();
-            continue;
         }
 
-        bool ready = false;
+        if (verificationSucceeded)
         {
-            WriteGuard l2(m_lock);
-            unique_lock<Mutex> l(m_verification);
-            if (!m_verifying.isEmpty() && m_verifying.nextHash() == work.hash)
+            bool ready = false;
             {
-                // we're next!
-                m_verifying.dequeue();
-                if (m_knownBad.count(res.verified.info.parentHash()))
+                WriteGuard l2(m_lock);
+                unique_lock<Mutex> l(m_verification);
+                if (!m_verifying.isEmpty() && m_verifying.nextHash() == work.hash)
                 {
-                    m_readySet.erase(res.verified.info.hash());
-                    m_knownBad.insert(res.verified.info.hash());
+                    // we're next!
+                    m_verifying.dequeue();
+                    if (m_knownBad.count(res.verified.info.parentHash()))
+                    {
+                        m_readySet.erase(res.verified.info.hash());
+                        m_knownBad.insert(res.verified.info.hash());
+                    }
+                    else
+                        m_verified.enqueue(move(res));
+
+                    drainVerified_WITH_BOTH_LOCKS();
+                    ready = true;
                 }
                 else
-                    m_verified.enqueue(move(res));
-
-                drainVerified_WITH_BOTH_LOCKS();
-                ready = true;
+                {
+                    if (!m_verifying.replace(work.hash, move(res)))
+                        cwarn << "BlockQueue missing our job: was there a GM?";
+                }
             }
-            else
-            {
-                if (!m_verifying.replace(work.hash, move(res)))
-                    cwarn << "BlockQueue missing our job: was there a GM?";
-            }
+            if (ready)
+                m_onReady();
         }
-        if (ready)
-            m_onReady();
+        if (wasFull && !knownFull())
+            m_onRoomAvailable();
     }
 }
 
